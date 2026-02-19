@@ -252,12 +252,16 @@ Only externally observable state changes generate events. Internal agent reasoni
 | `RiskAssignedToBroker`| risk_id, broker_id                                 | Market      | Broker selected to place this risk                     |
 | `RiskDeclined`        | risk_id, broker_id                                 | Market      | No syndicate willing to lead — risk unplaced           |
 
+> **Implementation gap:** `RiskDeclined` is emitted with payload `{"risk_id": risk_id}` only — `broker_id` is absent. The broker is recoverable by joining on `risk_id` against the preceding `RiskAssignedToBroker` event, but the fold is not self-contained.
+
 ### 3.2 Binding Events
 
 | Event               | Payload                                                              | Emitter | Purpose                                                    |
 | -------------------- | -------------------------------------------------------------------- | ------- | ---------------------------------------------------------- |
 | `PolicyBound`        | risk_id, broker_id, lead_id, lead_price, lead_line, follows[(id, line)], total_line | Market  | Policy fully placed with lead and follow syndicates        |
 | `PremiumDistributed` | risk_id, premiums_by_syndicate                                       | Market  | Premium income allocated proportionally by line size       |
+
+> **Implementation gap:** `PremiumDistributed` is **not emitted**. Premium allocation happens inside `book_policy()` as a direct capital mutation with no corresponding event. `PolicyBound` carries `price` and `shares[(sid, line)]`, so per-syndicate premiums (`price × line`) are derivable with arithmetic but are not surfaced as a named event. `PolicyBound` also omits `broker_id`; it is recoverable via the same `risk_id` join as above.
 
 ### 3.3 Loss Events
 
@@ -267,12 +271,16 @@ Only externally observable state changes generate events. Internal agent reasoni
 | `CatastropheOccurred`     | peril_region, total_damage           | Environment | Correlated regional loss fires from the queue        |
 | `ClaimPaid`               | syndicate_id, risk_id, amount, share | Market      | Loss cascaded to a specific syndicate on the policy  |
 
+> **Implementation note:** `ClaimPaid` is emitted with `{"risk_id": ..., "sid": ..., "amount": ..., "source": "attritional"|"catastrophe"}` — fully consistent with the spec. This is the one event category where the event store is the authoritative source for the loss-ratio projection.
+
 ### 3.4 Capital and Solvency Events
 
 | Event                | Payload                                     | Emitter | Purpose                                              |
 | -------------------- | ------------------------------------------- | ------- | ---------------------------------------------------- |
 | `DividendPaid`       | syndicate_id, amount                        | Market  | Annual profit distribution to capital providers      |
 | `SyndicateInsolvent` | syndicate_id, remaining_capital, portfolio  | Market  | Syndicate's capital falls below zero after a claim   |
+
+> **Implementation gaps:** `DividendPaid` is **not emitted**. `pay_dividend()` mutates capital and returns the amount, but emits nothing — dividend payments are invisible in the event store. `SyndicateInsolvent` is emitted with payload `{"sid": sid}` only; `remaining_capital` and `portfolio` at the moment of insolvency are not recorded and are not recoverable from the event stream alone.
 
 ### 3.5 Market Intelligence Events
 
@@ -281,20 +289,21 @@ Only externally observable state changes generate events. Internal agent reasoni
 | `IndustryStatsPublished`   | avg_claim_freq, avg_severity, avg_loss_ratio, avg_premium, period | Market  | Annual aggregate statistics for syndicate pricing   |
 | `AnnualReview`             | year                                                     | Pre-scheduled | Marker event triggering year-end housekeeping      |
 
-### 3.6 Typical Event Stream for One Risk
+### 3.6 Actual Event Stream for One Risk (as Implemented)
+
+The following reflects what `market.event_store` actually contains for a typical bound risk with one attritional loss:
 
 ```
-seq=1041  t=412.7  RiskArrived(risk_id=42, region=3, limit=10M)
-seq=1042  t=412.7  RiskAssignedToBroker(risk_id=42, broker_id=B2)
-seq=1043  t=412.7  PolicyBound(risk_id=42, lead=S1@50%, follows=[S3@20%, S7@30%], price=320K)
-seq=1044  t=412.7  PremiumDistributed(risk_id=42, {S1: 160K, S3: 64K, S7: 96K})
-seq=1045  t=518.2  AttritionalLossOccurred(risk_id=42, amount=45K)
-seq=1046  t=518.2  ClaimPaid(S1, risk_id=42, 22.5K)
-seq=1047  t=518.2  ClaimPaid(S3, risk_id=42, 9K)
-seq=1048  t=518.2  ClaimPaid(S7, risk_id=42, 13.5K)
+seq=1041  t=412.7  RiskArrived(risk_id=42, region=3, limit=1200)
+seq=1042  t=412.7  RiskAssignedToBroker(risk_id=42, broker_id=2, region=3)
+seq=1043  t=412.7  PolicyBound(risk_id=42, lead=1, price=94.3, shares=[(1,0.5),(3,0.25),(7,0.25)])
+seq=1044  t=518.2  AttritionalLoss(risk_id=42, amount=63.1)    # event kind is AttritionalLoss in queue
+seq=1045  t=518.2  ClaimPaid(risk_id=42, sid=1, amount=31.6, source="attritional")
+seq=1046  t=518.2  ClaimPaid(risk_id=42, sid=3, amount=15.8, source="attritional")
+seq=1047  t=518.2  ClaimPaid(risk_id=42, sid=7, amount=15.8, source="attritional")
 ```
 
-Seven events for the full lifecycle of one risk, each corresponding to a real-world observable action. Compare with ~25 events in the fully decomposed Olmez design.
+Six events versus the seven shown in the design (no `PremiumDistributed`). The broker_id in `RiskAssignedToBroker` is not repeated in `PolicyBound`. Compare with ~25 events in the fully decomposed Olmez design.
 
 ---
 
@@ -394,10 +403,13 @@ The simulation is driven by a priority queue of events sorted by simulation time
 
 ## 5. Projection (State Rebuild) Logic
 
-Each agent's current state is a left fold over its relevant event stream. A left fold starts from the beginning of the stream and walks forward chronologically, carrying an accumulator (the agent's state) that gets updated at each event. The final value of the accumulator is the agent's current state. There is no separate "state database" — state is entirely a consequence of processing every event in sequence.
+The design intent is that each agent's current state is a **left fold over its relevant event stream** — a pure function that walks the event log chronologically and accumulates state. There is no separate state database; state is entirely a consequence of the event sequence. This is the classical event-sourcing pattern.
+
+**The implementation diverges from this in one fundamental respect:** agent state (`Syndicate.capital`, `RelationshipState.strength`, etc.) is updated **in-place, synchronously, during event processing**. The event store is a secondary audit log, not the primary source of truth. Several state transitions — premium allocation, dividend payments — have no corresponding event at all. The projections below therefore note both the intended fold and how the projection is actually computed in the code.
 
 ### 5.1 Insurer Capital Projection
 
+**Design intent:**
 ```
 capital = initial_capital
 
@@ -408,8 +420,23 @@ for each event in stream where event involves this syndicate:
         DividendPaid(amount)         -> capital -= amount
 ```
 
+**Implementation:** `PremiumDistributed` and `DividendPaid` are never emitted. Capital is mutated directly in `book_policy()` and `pay_dividend()`. The event store cannot reconstruct capital for a given syndicate — `ClaimPaid` events are present, but premium income and dividend outflows are not. The implementation instead maintains `syndicate_yearly_capital[sid][year]` as a snapshotted dict updated at each `AnnualReview`, which serves as the practical capital projection.
+
+The fold from the event store is only **partially** possible:
+
+```
+# What you can recover from event_store:
+claims_paid[sid] = sum(e.payload["amount"] for e in event_store
+                       if e.kind == "ClaimPaid" and e.payload["sid"] == sid)
+
+# What you cannot recover (no events emitted):
+# - premium income per syndicate
+# - dividend payments
+```
+
 ### 5.2 Market Loss Ratio Projection
 
+**Design intent:**
 ```
 yearly_premiums = defaultdict(float)
 yearly_claims = defaultdict(float)
@@ -423,8 +450,22 @@ for each event in stream:
 loss_ratios = {y: yearly_claims[y] / yearly_premiums[y] for y in yearly_premiums}
 ```
 
+**Implementation:** `PremiumDistributed` is not emitted. `yearly_premiums` is tracked via a direct accumulator in `Market._handle_risk()`. An approximation of the premium fold is possible from `PolicyBound` events:
+
+```
+# Approximate fold from event_store (requires arithmetic, not a simple fold):
+for e in event_store where e.kind == "PolicyBound":
+    year = int(e.sim_time / 365)
+    price = e.payload["price"]
+    for (sid, line) in e.payload["shares"]:
+        yearly_premiums[year] += price * line
+```
+
+The claims fold works correctly from the event store since `ClaimPaid` is faithfully emitted. The loss-ratio projection is therefore achievable from the event store but requires the above arithmetic step for the premium side rather than folding over a named event.
+
 ### 5.3 Broker Performance Projection
 
+**Design intent:**
 ```
 for each event in stream:
     match event:
@@ -435,8 +476,25 @@ for each event in stream:
 placement_rate = {b: placements[b] / volume[b] for b in brokers}
 ```
 
+**Implementation:** `broker_volume` folds correctly from `RiskAssignedToBroker` (which includes `broker_id`). However, `PolicyBound` and `RiskDeclined` do not carry `broker_id` in their payloads. Placement and decline rates require a two-pass join on `risk_id`:
+
+```
+# Two-pass join required:
+assigned = {e.payload["risk_id"]: e.payload["broker_id"]
+            for e in event_store if e.kind == "RiskAssignedToBroker"}
+
+for e in event_store:
+    broker_id = assigned.get(e.payload.get("risk_id"))
+    if broker_id is None: continue
+    if e.kind == "PolicyBound":  broker_placements[broker_id] += 1
+    if e.kind == "RiskDeclined": broker_declines[broker_id] += 1
+```
+
+This is derivable but is not the simple single-pass fold described in the design.
+
 ### 5.4 Network Evolution Projection
 
+**Design intent:**
 ```
 for each event in stream:
     match event:
@@ -448,9 +506,43 @@ for each event in stream:
 # Reveals emergent clustering: which broker-syndicate pairs dominate
 ```
 
+**Implementation:** The network projection used in diagnostics is `market.network_snapshots[year]`, which records `RelationshipState.strength` per `(broker_id, syndicate_id)` pair at each `AnnualReview`. This is a **stock metric** (accumulated EWMA of relationship quality) rather than the **flow metric** (transaction volume) described in the design.
+
+The volume-based fold from the design is achievable via the same join described in §5.3, since `PolicyBound` carries `shares[(sid, line)]`. The strength-based snapshot captures more signal — it weights recency and price competitiveness, not just volume — but is not derivable from the event store alone because `RelationshipState` is mutated in-place with no corresponding events.
+
+The two metrics tell different stories: volume reveals which pairs transact most; strength reveals which pairs the broker currently prefers. Both are useful; neither is strictly more correct.
+
 ### 5.5 Branching and What-If
 
-Fork the event stream at any point, rebuild agent state by replaying to that point (or load from a snapshot), modify a parameter or inject a hypothetical event, and continue the simulation from that state. Pre-generated catastrophe events in the queue should be kept identical across branches to isolate the effect of the parameter change from stochastic variation.
+**Design intent:** Fork the event stream at any point, rebuild agent state by replaying to that point (or load from a snapshot), modify a parameter or inject a hypothetical event, and continue the simulation from that state. Pre-generated catastrophe events in the queue should be kept identical across branches to isolate the effect of the parameter change from stochastic variation.
+
+**Implementation:** Not supported. Experiments are run as entirely independent simulations from the same seed. This achieves isolation of stochastic variation (identical seeds → identical catastrophe schedules) but cannot inject a counterfactual event mid-simulation. Branching would require serialisable state snapshots, which in turn requires the full event-sourcing model to be in place.
+
+### 5.6 Trade-offs: Mutable State vs Event-Sourcing Purity
+
+The implementation chose mutable in-place state over the event-sourcing fold pattern. The trade-offs are as follows.
+
+**Arguments for mutable state (the choice made):**
+
+- **Performance.** Reconstructing `Syndicate` state from the full event log at every pricing call would be O(N²) in events. With 60-year runs, 25 risks/year, and 3–5 attritional losses per risk, the event store grows to ~20,000 events. Replaying that log every time a syndicate needs its `weighted_avg_claim` would dominate runtime. The implementation side-steps this entirely.
+
+- **Simplicity.** Each handler directly mutates the agent it affects. There is no separate projection layer, no snapshot machinery, no risk of a stale read. The code is ~680 lines and is straightforwardly auditable.
+
+- **Sufficient observability.** All loss events are recorded faithfully. Yearly premium and capital data are tracked in parallel accumulators that are cheap to maintain and correct by construction. For the research purpose of this simulation — cycle detection, sensitivity sweeps, ensemble statistics — these accumulators provide everything needed without event-store replay.
+
+- **No external consumers.** The motivation for true event-sourcing is usually that multiple independent systems need to reconstruct state from a shared log (e.g. after a crash, for an audit trail, for a read-model service). In a self-contained research simulation, the process does not crash and there are no external consumers.
+
+**Arguments for the event-sourcing fold pattern (the design intent):**
+
+- **Auditability.** A complete event log allows any state at any point in time to be reconstructed, including `remaining_capital` and `portfolio` at the moment of insolvency — currently unavailable. For regulatory or forensic use cases, this matters.
+
+- **Branching.** §5.5 branching and what-if analysis requires that agent state be fully reconstructable from the event log. Without it, counterfactual experiments require re-running the full simulation from scratch, which prevents isolating the effect of a mid-simulation parameter change from the random seed divergence that follows.
+
+- **Correctness under re-projection.** If a bug is found in a projection, the fix can be reapplied to historical runs simply by re-folding the event store. With mutable state, historical runs are gone.
+
+- **`DividendPaid` and `PremiumDistributed` gaps are small.** Adding these two event emissions would close most of the gap at low cost: `DividendPaid` is emitted once per syndicate per year; `PremiumDistributed` once per bound policy. The event volume increase is modest (~15–20%), and the side-channel accumulators could then be replaced by folds, removing the dual-tracking risk.
+
+**Pragmatic middle ground:** Emit `DividendPaid` and `PremiumDistributed`, add `broker_id` to `PolicyBound` and `RiskDeclined`, and complete the `SyndicateInsolvent` payload. This makes the event store self-sufficient for all four standard projections (§5.1–5.4) without restructuring the mutable-state architecture or paying the performance cost of full event-sourcing. The deeper fold purity — where agents are stateless projectors — remains a future option if the simulation is ever extended into a production or branching-capable system.
 
 ---
 
@@ -669,7 +761,7 @@ The full simulation code is available alongside this document (`simulation.py`);
 
 **Snapshots.** Periodically snapshot all agent state (e.g. at each `AnnualReview`) to accelerate replay for long simulations. Snapshots are derived data, always rebuildable from the event stream.
 
-**Projections.** Read-side projections are pure functions that fold over a filtered subset of the event stream to produce specific views: market loss ratio time series, individual syndicate solvency paths, broker placement rates, network evolution heatmaps, cycle detection (MBPD on projected loss ratios), insolvency probability distributions. Multiple projections can run in parallel over the same event store.
+**Projections.** The design intent is that read-side projections are pure functions folding over the event stream. In practice, the implementation maintains direct accumulator dicts (`yearly_premiums`, `yearly_claims`, `syndicate_yearly_capital`, `network_snapshots`) updated during event processing, because several state changes — premium allocation, dividends — have no corresponding event. The event store is an accurate audit log for loss and policy events but is not sufficient on its own to reconstruct capital or loss-ratio projections without the accumulators. See §5 for the full analysis of which projections are and are not achievable from the event store, and the trade-off discussion in §5.6.
 
 **Broker-syndicate network initialisation.** Seed from a stochastic block model: brokers in the same specialism cluster have higher initial relationship strength with syndicates that write that class, with noise. This gives realistic starting topology without hand-coding every edge. Static topologies from the literature (random, circular, weighted graph) are recovered as special cases by disabling relationship evolution.
 

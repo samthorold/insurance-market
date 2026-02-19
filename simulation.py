@@ -24,6 +24,7 @@ ATTRITIONAL_CLAIM_LAMBDA       = 0.6
 FOLLOW_MAX_LINE                = 0.4
 CAT_PARETO_SHAPE               = 2
 CAT_SEVERITY_SCALE             = 5000.0
+ENTRY_LR_THRESHOLD             = 1.00   # industry LR > 100% in a year → new capital enters
 
 
 # ── Event Kinds ──────────────────────────────────────────────────────────────
@@ -40,6 +41,7 @@ class EventKind(str, Enum):
     INDUSTRY_STATS          = "IndustryStatsPublished"
     RISK_ASSIGNED_TO_BROKER = "RiskAssignedToBroker"
     CLAIM_PAID              = "ClaimPaid"
+    SYNDICATE_ENTERED       = "SyndicateEntered"
 
 
 # ── Events ──────────────────────────────────────────────────────────────────
@@ -259,9 +261,11 @@ class Broker:
 
     def __init__(self, bid: int, syndicate_ids: list[int],
                  specialisms: set[int] | None = None,
-                 init_strength: float = 0.5, recency: float = 0.3) -> None:
+                 init_strength: float = 0.5, recency: float = 0.3,
+                 market_power: float = 1.0) -> None:
         """Initialize broker with relationships to all syndicates."""
         self.bid = bid
+        self.market_power = market_power
         self.specialisms: set[int] = specialisms or set()
         self.relationships: dict[int, RelationshipState] = {}
         for sid in syndicate_ids:
@@ -289,7 +293,12 @@ class Market:
     """Coordinates the discrete-event simulation of the insurance marketplace."""
 
     def __init__(self, syndicates: list[Syndicate], brokers: list[Broker],
-                 enable_lead_follow: bool = True) -> None:
+                 enable_lead_follow: bool = True,
+                 allow_entry: bool = False,
+                 allow_runoff: bool = False,
+                 n_syndicates_max: int = 20,
+                 entry_capital: float = 2000.0,
+                 entry_syndicate_params: dict | None = None) -> None:
         """Initialize the market with syndicates, brokers, and event infrastructure."""
         self.syndicates: dict[int, Syndicate] = {s.sid: s for s in syndicates}
         self.brokers: dict[int, Broker] = {b.bid: b for b in brokers}
@@ -304,13 +313,24 @@ class Market:
         self.industry_avg_severity = 100.0
         self.industry_avg_loss_ratio = 0.6
         self.industry_avg_premium = 100.0
+        self.industry_avg_markup: float = 0.0
         self.enable_lead_follow = enable_lead_follow
+        # Market-entry configuration
+        self.allow_entry = allow_entry
+        self.allow_runoff = allow_runoff
+        self.n_syndicates_max = n_syndicates_max
+        self._entry_capital = entry_capital
+        self._entry_syndicate_params: dict | None = entry_syndicate_params
+        self._entry_signal_years = 0
+        self._next_sid = len(syndicates)
         # Tracking
         self.yearly_premiums: defaultdict[int, float] = defaultdict(float)
         self.yearly_claims: defaultdict[int, float] = defaultdict(float)
         self.yearly_policies: defaultdict[int, int] = defaultdict(int)
         self.yearly_declines: defaultdict[int, int] = defaultdict(int)
         self.yearly_insolvencies: defaultdict[int, int] = defaultdict(int)
+        self.yearly_entries: defaultdict[int, int] = defaultdict(int)
+        self.yearly_central_fund: defaultdict[int, float] = defaultdict(float)
         self.syndicate_yearly_premiums: defaultdict[int, defaultdict[int, float]] = (
             defaultdict(lambda: defaultdict(float)))
         self.syndicate_yearly_claims: defaultdict[int, defaultdict[int, float]] = (
@@ -364,10 +384,15 @@ class Market:
         limit = p["limit"]
         year = int(t / 365)
 
-        # Assign broker: prefer specialism match, random tiebreak among equals
+        # Assign broker: prefer specialism match, weighted by market_power
         broker_list = list(self.brokers.values())
         specialist_brokers = [b for b in broker_list if region in b.specialisms]
-        broker = random.choice(specialist_brokers if specialist_brokers else broker_list)
+        candidates = specialist_brokers if specialist_brokers else broker_list
+        weights = [b.market_power for b in candidates]
+        if any(w != 1.0 for w in weights):
+            broker = random.choices(candidates, weights=weights, k=1)[0]
+        else:
+            broker = random.choice(candidates)
         self._emit(t, EventKind.RISK_ASSIGNED_TO_BROKER, {
             "risk_id": risk_id, "broker_id": broker.bid, "region": region
         })
@@ -447,11 +472,13 @@ class Market:
         # Premium per risk ≈ actuarial_price * total_line ≈ 100 * 0.75
         # Need claims ≈ 0.6 * 75 = 45 per risk on average
         # Use Poisson(0.6) claims per risk, mean severity ≈ 75
-        n_losses = _poisson_sample(ATTRITIONAL_CLAIM_LAMBDA)
+        claim_lambda = p.get("claim_lambda", ATTRITIONAL_CLAIM_LAMBDA)
+        n_losses = _poisson_sample(claim_lambda)
         for _ in range(n_losses):
             loss_t = t + random.uniform(1, duration)
             cov = 0.7
-            mu = self.industry_avg_claim * 0.75
+            sev_mu = p.get("sev_mu")
+            mu = sev_mu if sev_mu is not None else self.industry_avg_claim * 0.75
             severity = random.gammavariate(1 / cov**2, mu * cov**2)
             self.push(loss_t, EventKind.ATTRITIONAL_LOSS, {
                 "risk_id": risk_id, "amount": severity
@@ -479,6 +506,44 @@ class Market:
                 if not s.is_solvent:
                     self._emit(t, EventKind.SYNDICATE_INSOLVENT, {"sid": sid})
                     self.yearly_insolvencies[year] += 1
+            elif self.allow_runoff:
+                # Insolvent syndicate in managed runoff: Central Fund pays.
+                # Do NOT call s.receive_claim() — EWMA state is frozen.
+                self.yearly_claims[year] += claim
+                self.yearly_central_fund[year] += claim
+                self._emit(t, EventKind.CLAIM_PAID, {
+                    "risk_id": risk_id, "sid": sid, "amount": claim,
+                    "source": "central_fund"
+                })
+
+    def _admit_new_syndicate(self, t: float, year: int) -> None:
+        """Instantiate a new syndicate and register it with all brokers."""
+        sid = self._next_sid
+        self._next_sid += 1
+        params: dict = {
+            "sid": sid,
+            "capital": self._entry_capital * random.uniform(0.8, 1.2),
+            "z": random.uniform(0.2, 0.4),
+            "w": random.uniform(0.15, 0.25),
+            "alpha": 0.001,
+            "beta": random.uniform(0.35, 0.5),
+            "expense_rate": random.uniform(0.30, 0.40),
+            "gamma_div": 0.3,
+            "initial_claim_est": 75.0,
+            "initial_std": 10.0,
+        }
+        if self._entry_syndicate_params:
+            params.update(self._entry_syndicate_params)
+        new_syn = Syndicate(**params)
+        self.syndicates[sid] = new_syn
+        # Register with all brokers at modest initial strength (newcomer effect)
+        for broker in self.brokers.values():
+            existing = next(iter(broker.relationships.values()), None)
+            recency = existing.recency if existing else 0.4
+            broker.relationships[sid] = RelationshipState(strength=0.3, recency=recency)
+        self._emit(t, EventKind.SYNDICATE_ENTERED,
+                   {"sid": sid, "year": year, "capital": new_syn.capital})
+        self.yearly_entries[year] += 1
 
     def _handle_catastrophe(self, t: float, p: dict) -> None:
         """Allocate catastrophe losses across active policies in the affected region."""
@@ -519,6 +584,14 @@ class Market:
                     if not s.is_solvent:
                         self._emit(t, EventKind.SYNDICATE_INSOLVENT, {"sid": sid})
                         self.yearly_insolvencies[year] += 1
+                elif self.allow_runoff:
+                    # Insolvent syndicate in managed runoff: Central Fund pays.
+                    self.yearly_claims[year] += claim
+                    self.yearly_central_fund[year] += claim
+                    self._emit(t, EventKind.CLAIM_PAID, {
+                        "risk_id": rid, "sid": sid, "amount": claim,
+                        "source": "central_fund", "region": region
+                    })
         # No re-emit: the CatastropheOccurred event was already logged by run()
 
     def _handle_annual_review(self, t: float, p: dict) -> None:
@@ -536,11 +609,18 @@ class Market:
         for sid, s in self.syndicates.items():
             self.syndicate_yearly_capital[sid][year] = s.capital
 
-        # Compute industry average claim
-        all_claims = [s.weighted_avg_claim for s in self.syndicates.values()
-                      if s.is_solvent]
-        if all_claims:
-            self.industry_avg_claim = sum(all_claims) / len(all_claims)
+        # Compute industry averages
+        solvent = [s for s in self.syndicates.values() if s.is_solvent]
+        if solvent:
+            self.industry_avg_claim  = sum(s.weighted_avg_claim for s in solvent) / len(solvent)
+            self.industry_avg_markup = sum(s.markup for s in solvent) / len(solvent)
+
+        # Market entry: one new syndicate if industry LR > 100% in a year
+        year_prem = self.yearly_premiums.get(year, 0.0)
+        year_lr = (self.yearly_claims.get(year, 0.0) / year_prem if year_prem > 0 else 0.0)
+        if self.allow_entry and len(solvent) < self.n_syndicates_max:
+            if year_lr > ENTRY_LR_THRESHOLD:
+                self._admit_new_syndicate(t, year)
 
         # Compute additional IndustryStats fields
         total_prem   = self.yearly_premiums.get(year, 0.0)
@@ -605,12 +685,17 @@ def build_simulation(
     horizon_years: int = 50,
     risks_per_year: int = 25,
     initial_capital: float = 2000.0,
-    cat_freq: float = 0.05,
+    cat_freq: float | dict[int, float] = 0.05,
     enable_cats: bool = True,
     enable_lead_follow: bool = True,
     evolve_network: bool = True,
     seed: int = 42,
-    syndicate_params: dict | None = None
+    syndicate_params: dict | None = None,
+    lob_params: dict[int, dict] | None = None,
+    broker_power: float = 0.0,
+    allow_entry: bool = False,
+    allow_runoff: bool = False,
+    n_syndicates_max: int = 20,
 ) -> Market:
     """Build and return a Market populated with syndicates, brokers, and scheduled events."""
     random.seed(seed)
@@ -644,7 +729,18 @@ def build_simulation(
                               specialisms=specs, init_strength=init_str,
                               recency=recency))
 
-    market = Market(syndicates, brokers, enable_lead_follow=enable_lead_follow)
+    # Assign Zipf market-power weights when requested (rank 1 = most powerful)
+    if broker_power > 0.0:
+        for rank, b in enumerate(brokers, start=1):
+            b.market_power = 1.0 / (rank ** broker_power)
+
+    market = Market(syndicates, brokers,
+                    enable_lead_follow=enable_lead_follow,
+                    allow_entry=allow_entry,
+                    allow_runoff=allow_runoff,
+                    n_syndicates_max=n_syndicates_max,
+                    entry_capital=initial_capital,
+                    entry_syndicate_params=syndicate_params)
 
     # Schedule risk arrivals (Poisson process)
     risk_id = 0
@@ -653,16 +749,27 @@ def build_simulation(
         for _ in range(n_risks):
             t_arrival = year * 365 + random.uniform(0, 365)
             region = random.randint(0, n_regions - 1)
-            limit = random.uniform(500, 2000)
-            market.push(t_arrival, EventKind.RISK_ARRIVED, {
-                "risk_id": risk_id, "region": region, "limit": limit
-            })
+            if lob_params is not None:
+                lp = lob_params.get(region, {})
+                lo, hi = lp.get("limit", (500, 2000))
+                limit = random.uniform(lo, hi)
+                payload: dict = {
+                    "risk_id": risk_id, "region": region, "limit": limit,
+                    "claim_lambda": lp.get("lambda", ATTRITIONAL_CLAIM_LAMBDA),
+                    "sev_mu": lp.get("sev_mu", None),
+                }
+            else:
+                limit = random.uniform(500, 2000)
+                payload = {"risk_id": risk_id, "region": region, "limit": limit}
+            market.push(t_arrival, EventKind.RISK_ARRIVED, payload)
             risk_id += 1
 
     # Schedule catastrophes: Poisson per region, Pareto severity
     if enable_cats:
+        _freq = (cat_freq if isinstance(cat_freq, dict)
+                 else {r: cat_freq for r in range(n_regions)})
         for region in range(n_regions):
-            lam = cat_freq * horizon_years
+            lam = _freq.get(region, 0.0) * horizon_years
             n_cats = _poisson_sample(lam)
             for _ in range(n_cats):
                 t_cat = random.uniform(0, horizon_years * 365)
