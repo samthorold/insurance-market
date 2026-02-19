@@ -3043,6 +3043,772 @@ def plot_16_calibration(results: list[CalibResult],
     return path
 
 
+# ── Section: Experiment 3b — High-Volume Lloyd's-Realistic Density ────────────
+
+class HighVolumeResult(NamedTuple):
+    label:            str
+    risks_per_year:   int
+    n_syndicates:     int
+    risks_per_syn_yr: float        # rpy / n_syn
+    mean_lr:          float
+    mean_amplitude:   float
+    mean_period:      float | None
+    mean_hhi:         float
+    mean_cr:          float
+    mean_roc:         float
+    lr_cv:            float        # std/mean of LR series — primary LLN metric
+    runtime_seconds:  float
+    lr_by_seed:       dict[int, dict[int, float]]
+    cr_by_seed:       dict[int, dict[int, float]]
+    roc_by_seed:      dict[int, dict[int, float]]
+
+
+def run_high_volume_sweep(
+    configs: list[tuple[str, int, int, int, int]],  # (label, n_syn, n_brok, rpy, cap)
+    n_seeds:  int = 5,
+    horizon:  int = 25,
+) -> list[HighVolumeResult]:
+    """Compare ref (low-rpy) vs high-volume arms; no cats, no lob_params."""
+    print(f"\n  High-volume sweep: {len(configs)} configs × {n_seeds} seeds × {horizon}yr")
+    results = []
+    for label, n_syn, n_brok, rpy, cap in configs:
+        rps = rpy / n_syn
+        print(f"    [{label:<18}] n_syn={n_syn}, rpy={rpy} ({rps:.1f}/syn/yr) ...",
+              end=" ", flush=True)
+        t0 = time.time()
+
+        periods, amplitudes, hhi_vals = [], [], []
+        lr_by_seed:  dict[int, dict[int, float]] = {}
+        cr_by_seed:  dict[int, dict[int, float]] = {}
+        roc_by_seed: dict[int, dict[int, float]] = {}
+
+        for seed in range(n_seeds):
+            m = build_simulation(
+                n_syndicates=n_syn,
+                n_brokers=n_brok,
+                risks_per_year=rpy,
+                initial_capital=cap,
+                horizon_years=horizon,
+                enable_cats=False,
+                lob_params=None,
+                seed=seed,
+            )
+            m.run()
+
+            lr = extract_yearly_loss_ratios(m, horizon)
+            lr_by_seed[seed] = lr
+            cr = compute_combined_ratio_series(m, horizon)
+            cr_by_seed[seed] = cr
+            roc = compute_roc_series(m, horizon)
+            roc_by_seed[seed] = roc
+
+            cs = detect_cycle(lr)
+            if cs.period_years is not None:
+                periods.append(cs.period_years)
+            amplitudes.append(cs.amplitude)
+            hhi_vals.append(_compute_time_avg_hhi(m, horizon))
+
+            # Smoke-check on seed 0
+            if seed == 0:
+                total_bound   = len(m.risk_registry)
+                total_declined = sum(
+                    1 for ev in m.event_store
+                    if ev.kind == EventKind.RISK_DECLINED
+                ) if hasattr(EventKind, "RISK_DECLINED") else 0
+                max_pcr = 0.0
+                for sid in m.syndicates:
+                    annual_prems = [
+                        m.syndicate_yearly_premiums[sid].get(y, 0.0)
+                        for y in range(horizon)
+                    ]
+                    max_prem = max(annual_prems) if annual_prems else 0.0
+                    cap_val  = m.syndicate_yearly_capital[sid].get(0, float("nan"))
+                    if cap_val > 0:
+                        max_pcr = max(max_pcr, max_prem / cap_val)
+                decline_rate = (
+                    total_declined / (total_bound + total_declined) * 100
+                    if (total_bound + total_declined) > 0 else 0.0
+                )
+                print(f"\n      [smoke seed=0] bound={total_bound}, "
+                      f"decline_rate={decline_rate:.1f}%, max_PCR={max_pcr:.3f}")
+                print(f"      ", end="")
+
+        runtime = time.time() - t0
+
+        mean_period    = statistics.mean(periods)    if periods    else None
+        mean_amplitude = statistics.mean(amplitudes) if amplitudes else 0.0
+        valid_hhi      = [h for h in hhi_vals if not math.isnan(h)]
+        mean_hhi       = statistics.mean(valid_hhi)  if valid_hhi  else float("nan")
+
+        all_lr  = [v for d in lr_by_seed.values()  for v in d.values()]
+        all_cr  = [v for d in cr_by_seed.values()  for v in d.values()]
+        all_roc = [v for d in roc_by_seed.values() for v in d.values()]
+
+        mean_lr  = statistics.mean(all_lr)  if all_lr  else float("nan")
+        mean_cr  = statistics.mean(all_cr)  if all_cr  else float("nan")
+        mean_roc = statistics.mean(all_roc) if all_roc else float("nan")
+
+        std_lr = statistics.stdev(all_lr) if len(all_lr) > 1 else 0.0
+        lr_cv  = std_lr / mean_lr if mean_lr > 0 else float("nan")
+
+        ps = f"{mean_period:.1f}" if mean_period is not None else "N/A"
+        print(f"period={ps}, LR={mean_lr:.3f}, CV={lr_cv:.3f}, "
+              f"amp={mean_amplitude:.3f}, HHI={mean_hhi:.3f}, t={runtime:.0f}s")
+
+        results.append(HighVolumeResult(
+            label=label,
+            risks_per_year=rpy,
+            n_syndicates=n_syn,
+            risks_per_syn_yr=rps,
+            mean_lr=mean_lr,
+            mean_amplitude=mean_amplitude,
+            mean_period=mean_period,
+            mean_hhi=mean_hhi,
+            mean_cr=mean_cr,
+            mean_roc=mean_roc,
+            lr_cv=lr_cv,
+            runtime_seconds=runtime,
+            lr_by_seed=lr_by_seed,
+            cr_by_seed=cr_by_seed,
+            roc_by_seed=roc_by_seed,
+        ))
+    return results
+
+
+def plot_23_high_volume(results: list[HighVolumeResult], filename: str) -> str:
+    """Six-panel: LR ensemble / LR CV / cycle bars / scorecard / RoC / summary table."""
+    if not results:
+        return ""
+
+    n = len(results)
+    cmap   = plt.cm.tab10  # type: ignore[attr-defined]
+    colors = [cmap(i / 10) for i in range(n)]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    ax_lr, ax_cv, ax_cycle = axes[0, 0], axes[0, 1], axes[0, 2]
+    ax_score, ax_roc, ax_table = axes[1, 0], axes[1, 1], axes[1, 2]
+
+    horizon = max(
+        (max(lr_d.keys()) + 1
+         for r in results
+         for lr_d in r.lr_by_seed.values() if lr_d),
+        default=25,
+    )
+    all_years = list(range(horizon))
+
+    # ── Panel 1: Ensemble mean LR ±1σ ────────────────────────────────────────
+    for res, color in zip(results, colors):
+        means, stds = [], []
+        for y in all_years:
+            vals = [res.lr_by_seed[s][y] for s in res.lr_by_seed
+                    if y in res.lr_by_seed[s]]
+            means.append(statistics.mean(vals) if vals else float("nan"))
+            stds.append(statistics.stdev(vals) if len(vals) > 1 else 0.0)
+        yrs_a   = np.array(all_years)
+        means_a = np.array(means)
+        stds_a  = np.array(stds)
+        valid   = ~np.isnan(means_a)
+        ax_lr.plot(yrs_a[valid], means_a[valid], color=color,
+                   linewidth=2, label=res.label)
+        ax_lr.fill_between(yrs_a[valid],
+                           means_a[valid] - stds_a[valid],
+                           means_a[valid] + stds_a[valid],
+                           color=color, alpha=0.15)
+    ax_lr.axhline(1.0, color="red",    linestyle="--", linewidth=0.8, label="LR=1.0")
+    ax_lr.axhline(0.6, color="orange", linestyle=":",  linewidth=0.8, label="LR=0.6")
+    ax_lr.set_title("Ensemble Mean Loss Ratio (±1σ)")
+    ax_lr.set_xlabel("Year"); ax_lr.set_ylabel("Loss Ratio")
+    ax_lr.legend(fontsize=8)
+
+    # ── Panel 2: Per-year LR CV (σ/μ across seeds) — LLN test ───────────────
+    for res, color in zip(results, colors):
+        cvs = []
+        for y in all_years:
+            vals = [res.lr_by_seed[s][y] for s in res.lr_by_seed
+                    if y in res.lr_by_seed[s]]
+            if len(vals) > 1:
+                mu = statistics.mean(vals)
+                sd = statistics.stdev(vals)
+                cvs.append(sd / mu if mu > 0 else float("nan"))
+            else:
+                cvs.append(float("nan"))
+        valid_mask = [not math.isnan(c) for c in cvs]
+        yrs_v  = [y for y, v in zip(all_years, valid_mask) if v]
+        cvs_v  = [c for c, v in zip(cvs, valid_mask) if v]
+        ax_cv.plot(yrs_v, cvs_v, color=color, linewidth=1.5, label=res.label)
+    ax_cv.set_title("Per-Year LR Coefficient of Variation (σ/μ across seeds)\nLLN test: lower CV = smoother pricing")
+    ax_cv.set_xlabel("Year"); ax_cv.set_ylabel("CV (σ/μ)")
+    ax_cv.legend(fontsize=8)
+
+    # ── Panel 3: Cycle period and amplitude bar chart ─────────────────────────
+    x      = np.arange(n)
+    width  = 0.35
+    labels = [r.label for r in results]
+
+    periods_v  = [r.mean_period    if r.mean_period is not None else 0.0 for r in results]
+    amps_v     = [r.mean_amplitude for r in results]
+
+    ax_cycle_r = ax_cycle.twinx()
+    ax_cycle.bar(x - width / 2, periods_v, width, label="Period (yr)",
+                 color="steelblue", alpha=0.8)
+    ax_cycle_r.bar(x + width / 2, amps_v, width, label="Amplitude",
+                   color="darkorange", alpha=0.8)
+    ax_cycle.set_xticks(x)
+    ax_cycle.set_xticklabels(labels, rotation=10, ha="right", fontsize=9)
+    ax_cycle.set_ylabel("Cycle Period (yr)", color="steelblue")
+    ax_cycle_r.set_ylabel("Amplitude", color="darkorange")
+    ax_cycle.set_title("Cycle Period & Amplitude Comparison")
+    ax_cycle.tick_params(axis="y", labelcolor="steelblue")
+    ax_cycle_r.tick_params(axis="y", labelcolor="darkorange")
+    lines1, labels1 = ax_cycle.get_legend_handles_labels()
+    lines2, labels2 = ax_cycle_r.get_legend_handles_labels()
+    ax_cycle.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
+
+    # ── Panel 4: Calibration scorecard vs Lloyd's bands ───────────────────────
+    score_metrics = ["hhi", "combined_ratio", "roc"]
+    score_labels  = {"hhi": "HHI", "combined_ratio": "Combined Ratio", "roc": "Return on Capital"}
+
+    def get_score_val(res: HighVolumeResult, m: str) -> float:
+        if m == "hhi":            return res.mean_hhi
+        if m == "combined_ratio": return res.mean_cr
+        if m == "roc":            return res.mean_roc
+        return float("nan")
+
+    y_pos = list(range(len(score_metrics)))
+    ax_score.set_yticks(y_pos)
+    ax_score.set_yticklabels([score_labels[m] for m in score_metrics], fontsize=9)
+    ax_score.set_title("Scorecard vs Lloyd's Benchmarks")
+
+    for yi, m in enumerate(score_metrics):
+        lo, hi = LLOYDS_BENCHMARKS[m]
+        ax_score.barh(yi, hi - lo, left=lo, height=0.4,
+                      color="green", alpha=0.20, zorder=1)
+        ax_score.plot([lo, hi], [yi, yi], color="green", linewidth=1.5, zorder=2)
+        for ri, (res, col) in enumerate(zip(results, colors)):
+            val = get_score_val(res, m)
+            if not math.isnan(val):
+                ax_score.scatter(val, yi + 0.15 * ri - 0.075 * (n - 1),
+                                 color=col, s=70, zorder=5,
+                                 label=res.label if yi == 0 else "")
+    ax_score.set_xlabel("Metric value")
+    ax_score.legend(fontsize=8, loc="lower right")
+
+    # ── Panel 5: Return on Capital time series ────────────────────────────────
+    roc_lo, roc_hi = LLOYDS_BENCHMARKS["roc"]
+    ax_roc.axhspan(roc_lo, roc_hi, color="green", alpha=0.10,
+                   label=f"Lloyd's RoC band ({roc_lo:.0%}–{roc_hi:.0%})")
+    ax_roc.axhline(0, color="red", linestyle="--", linewidth=0.8)
+    for res, color in zip(results, colors):
+        means = []
+        for y in all_years:
+            vals = [res.roc_by_seed[s][y] for s in res.roc_by_seed
+                    if y in res.roc_by_seed[s]]
+            means.append(statistics.mean(vals) if vals else float("nan"))
+        yrs_a   = np.array(all_years)
+        means_a = np.array(means)
+        valid   = ~np.isnan(means_a)
+        ax_roc.plot(yrs_a[valid], means_a[valid], color=color,
+                    linewidth=1.5, label=res.label)
+    ax_roc.set_title("Return on Capital (ensemble mean)")
+    ax_roc.set_xlabel("Year"); ax_roc.set_ylabel("RoC")
+    ax_roc.legend(fontsize=8)
+
+    # ── Panel 6: Summary table ────────────────────────────────────────────────
+    ax_table.axis("off")
+    col_headers = ["Label", "rpy", "rps/syn", "Period", "Amp", "LR", "CV", "HHI", "t(s)"]
+    rows = []
+    for res in results:
+        ps = f"{res.mean_period:.1f}" if res.mean_period is not None else "N/A"
+        rows.append([
+            res.label,
+            str(res.risks_per_year),
+            f"{res.risks_per_syn_yr:.0f}",
+            ps,
+            f"{res.mean_amplitude:.3f}",
+            f"{res.mean_lr:.3f}",
+            f"{res.lr_cv:.3f}",
+            f"{res.mean_hhi:.3f}",
+            f"{res.runtime_seconds:.0f}",
+        ])
+    tbl = ax_table.table(
+        cellText=rows,
+        colLabels=col_headers,
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1.0, 1.5)
+    ax_table.set_title("Summary Statistics", pad=12)
+
+    fig.suptitle(
+        "Experiment 3b: High-Volume Lloyd's-Realistic Density\n"
+        "20 syn / 10 brok / 2000 rpy = 100 risks/syn/yr (~8% of Lloyd's) | "
+        "5 seeds × 25yr | no cats | capital=50 000 (peril-exposure headroom)",
+        fontsize=11,
+    )
+    plt.tight_layout()
+    path = f"{OUTPUT_DIR}/{filename}"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+# ── Section: Experiment 3c — Catastrophe Calibration Regime ──────────────────
+
+class CatCalibResult(NamedTuple):
+    label:               str
+    n_syndicates:        int
+    n_brokers:           int
+    risks_per_year:      int
+    initial_capital:     float
+    cat_freq:            float
+    # Primary calibration metrics
+    mean_cat_lr_delta:   float        # mean(LR_cat[y] − LR_nocat[y]) in cat-active years
+    std_cat_lr_delta:    float
+    wipeout_fraction:    float        # fraction of cat events where damage ≥ total_exposure
+    mean_lr_cat:         float
+    mean_lr_nocat:       float
+    # Standard market metrics (cat arm)
+    mean_period:         float | None
+    mean_amplitude:      float
+    mean_hhi:            float
+    mean_cr:             float
+    mean_roc:            float
+    runtime_seconds:     float
+    # Seed-level detail for plotting
+    lr_by_seed_cat:      dict        # {seed: {year: lr}}
+    lr_by_seed_nocat:    dict        # {seed: {year: lr}}
+    cat_delta_by_seed:   dict        # {seed: mean_delta}
+    cr_by_seed:          dict        # {seed: {year: cr}}
+    roc_by_seed:         dict        # {seed: {year: roc}}
+    cat_events_per_seed: dict        # {seed: [{damage, total_exposure, wipeout, year, region}]}
+
+
+def _extract_cat_event_stats(
+    market: Market,
+    horizon: int,
+) -> list[dict]:
+    """Extract per-event calibration stats for each CATASTROPHE_OCCURRED event.
+
+    Returns list of dicts with keys: damage, total_exposure, wipeout, year, region.
+    total_exposure is reconstructed from risk_registry (sum of limits for active
+    policies in the affected region at the cat event's sim_time), matching the
+    logic in Market._handle_catastrophe.
+    """
+    events = []
+    for ev in market.event_store:
+        if ev.kind != EventKind.CATASTROPHE_OCCURRED:
+            continue
+        t = ev.sim_time
+        year = int(t / 365)
+        if year >= horizon:
+            continue
+        region = ev.payload["region"]
+        damage = ev.payload["damage"]
+
+        # Reconstruct active regional exposure at time t (mirrors _handle_catastrophe)
+        total_exposure = sum(
+            pol["limit"]
+            for pol in market.risk_registry.values()
+            if pol["region"] == region
+            and pol["bound_at"] <= t < pol["bound_at"] + 365
+        )
+        # wipeout: entire regional exposure absorbed, every policy hit at full limit
+        wipeout = total_exposure > 0 and damage >= total_exposure
+        events.append({
+            "damage": damage,
+            "total_exposure": total_exposure,
+            "wipeout": wipeout,
+            "year": year,
+            "region": region,
+        })
+    return events
+
+
+def run_cat_calib_sweep(
+    configs: list[tuple],   # (label, n_syn, n_brok, rpy, capital, cat_freq)
+    n_seeds: int = 5,
+    horizon: int = 50,
+) -> list[CatCalibResult]:
+    """Run 2-arm (cat / no-cat) sweep for each config; compute calibration metrics.
+
+    Identical seed → identical attritional path → clean counterfactual.
+    Cat LR delta computed only over years where ≥1 cat event occurred.
+    """
+    print(f"\n  Cat calibration sweep: {len(configs)} configs × {n_seeds} seeds "
+          f"× {horizon}yr (2-arm cat/no-cat)")
+    results = []
+
+    for label, n_syn, n_brok, rpy, capital, cat_freq in configs:
+        print(f"    [{label:<28}] n_syn={n_syn}, rpy={rpy}, "
+              f"cap={capital:.0f}, cat_freq={cat_freq:.2f} ...",
+              end=" ", flush=True)
+        t0 = time.time()
+
+        periods, amplitudes, hhi_vals = [], [], []
+        lr_by_seed_cat:    dict[int, dict[int, float]] = {}
+        lr_by_seed_nocat:  dict[int, dict[int, float]] = {}
+        cat_delta_by_seed: dict[int, float]            = {}
+        cr_by_seed:        dict[int, dict[int, float]] = {}
+        roc_by_seed:       dict[int, dict[int, float]] = {}
+        cat_events_per_seed: dict[int, list[dict]]     = {}
+        all_cat_events: list[dict] = []
+
+        for seed in range(n_seeds):
+            # ── Cat arm ──────────────────────────────────────────────────────
+            m_cat = build_simulation(
+                n_syndicates=n_syn,
+                n_brokers=n_brok,
+                risks_per_year=rpy,
+                initial_capital=capital,
+                horizon_years=horizon,
+                enable_cats=True,
+                cat_freq=cat_freq,
+                seed=seed,
+            )
+            m_cat.run()
+
+            lr_cat = extract_yearly_loss_ratios(m_cat, horizon)
+            lr_by_seed_cat[seed] = lr_cat
+
+            cr = compute_combined_ratio_series(m_cat, horizon)
+            cr_by_seed[seed] = cr
+            roc = compute_roc_series(m_cat, horizon)
+            roc_by_seed[seed] = roc
+
+            cs = detect_cycle(lr_cat)
+            if cs.period_years is not None:
+                periods.append(cs.period_years)
+            amplitudes.append(cs.amplitude)
+            hhi_vals.append(_compute_time_avg_hhi(m_cat, horizon))
+
+            evts = _extract_cat_event_stats(m_cat, horizon)
+            cat_events_per_seed[seed] = evts
+            all_cat_events.extend(evts)
+
+            # ── No-cat arm (same seed → same attritional path) ────────────
+            m_nocat = build_simulation(
+                n_syndicates=n_syn,
+                n_brokers=n_brok,
+                risks_per_year=rpy,
+                initial_capital=capital,
+                horizon_years=horizon,
+                enable_cats=False,
+                seed=seed,
+            )
+            m_nocat.run()
+
+            lr_nocat = extract_yearly_loss_ratios(m_nocat, horizon)
+            lr_by_seed_nocat[seed] = lr_nocat
+
+            # LR delta in cat-active years only
+            cat_years = {ev["year"] for ev in evts}
+            deltas = [
+                lr_cat.get(y, 0.0) - lr_nocat.get(y, 0.0)
+                for y in cat_years
+                if y in lr_cat and y in lr_nocat
+            ]
+            cat_delta_by_seed[seed] = statistics.mean(deltas) if deltas else 0.0
+
+        runtime = time.time() - t0
+
+        mean_period    = statistics.mean(periods)    if periods    else None
+        mean_amplitude = statistics.mean(amplitudes) if amplitudes else 0.0
+        valid_hhi      = [h for h in hhi_vals if not math.isnan(h)]
+        mean_hhi       = statistics.mean(valid_hhi)  if valid_hhi  else float("nan")
+
+        all_lr_cat   = [v for d in lr_by_seed_cat.values()   for v in d.values()]
+        all_lr_nocat = [v for d in lr_by_seed_nocat.values() for v in d.values()]
+        all_cr       = [v for d in cr_by_seed.values()        for v in d.values()]
+        all_roc      = [v for d in roc_by_seed.values()       for v in d.values()]
+
+        mean_lr_cat   = statistics.mean(all_lr_cat)   if all_lr_cat   else float("nan")
+        mean_lr_nocat = statistics.mean(all_lr_nocat) if all_lr_nocat else float("nan")
+        mean_cr       = statistics.mean(all_cr)        if all_cr       else float("nan")
+        mean_roc      = statistics.mean(all_roc)       if all_roc      else float("nan")
+
+        delta_vals        = list(cat_delta_by_seed.values())
+        mean_cat_lr_delta = statistics.mean(delta_vals)  if delta_vals          else 0.0
+        std_cat_lr_delta  = statistics.stdev(delta_vals) if len(delta_vals) > 1 else 0.0
+
+        n_wipeout        = sum(1 for ev in all_cat_events if ev["wipeout"])
+        wipeout_fraction = (n_wipeout / len(all_cat_events)
+                            if all_cat_events else float("nan"))
+
+        ps = f"{mean_period:.1f}" if mean_period is not None else "N/A"
+        wf = f"{wipeout_fraction*100:.0f}%" if not math.isnan(wipeout_fraction) else "N/A"
+        print(f"period={ps}, cat_delta={mean_cat_lr_delta*100:.1f}pp, "
+              f"wipeout={wf}, HHI={mean_hhi:.3f}, t={runtime:.0f}s")
+
+        results.append(CatCalibResult(
+            label=label,
+            n_syndicates=n_syn,
+            n_brokers=n_brok,
+            risks_per_year=rpy,
+            initial_capital=capital,
+            cat_freq=cat_freq,
+            mean_cat_lr_delta=mean_cat_lr_delta,
+            std_cat_lr_delta=std_cat_lr_delta,
+            wipeout_fraction=wipeout_fraction,
+            mean_lr_cat=mean_lr_cat,
+            mean_lr_nocat=mean_lr_nocat,
+            mean_period=mean_period,
+            mean_amplitude=mean_amplitude,
+            mean_hhi=mean_hhi,
+            mean_cr=mean_cr,
+            mean_roc=mean_roc,
+            runtime_seconds=runtime,
+            lr_by_seed_cat=lr_by_seed_cat,
+            lr_by_seed_nocat=lr_by_seed_nocat,
+            cat_delta_by_seed=cat_delta_by_seed,
+            cr_by_seed=cr_by_seed,
+            roc_by_seed=roc_by_seed,
+            cat_events_per_seed=cat_events_per_seed,
+        ))
+
+    return results
+
+
+def plot_24_cat_calibration(results: list[CatCalibResult], filename: str) -> str:
+    """Six-panel: delta bars / regime / LR time series / scorecard / phase / table."""
+    if not results:
+        return ""
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    ax_delta, ax_regime, ax_ts     = axes[0, 0], axes[0, 1], axes[0, 2]
+    ax_score, ax_phase, ax_table   = axes[1, 0], axes[1, 1], axes[1, 2]
+
+    n      = len(results)
+    labels = [r.label for r in results]
+    x      = np.arange(n)
+
+    # ── Panel 1: Cat LR delta bars ±1σ (colour by wipeout_fraction) ──────────
+    def _wipeout_colour(wf: float) -> str:
+        if math.isnan(wf) or wf > 0.80:
+            return "firebrick"
+        if wf > 0.30:
+            return "darkorange"
+        return "forestgreen"
+
+    bar_colours = [_wipeout_colour(r.wipeout_fraction) for r in results]
+    deltas_pp   = [r.mean_cat_lr_delta * 100 for r in results]
+    std_pp      = [r.std_cat_lr_delta  * 100 for r in results]
+
+    ax_delta.barh(x, deltas_pp, xerr=std_pp, color=bar_colours, alpha=0.8,
+                  height=0.6, capsize=4)
+    ax_delta.axvspan(30, 50, color="green", alpha=0.15,
+                     label="Lloyd's target [30–50 pp]")
+    ax_delta.set_yticks(x)
+    ax_delta.set_yticklabels(labels, fontsize=9)
+    ax_delta.set_xlabel("Cat LR delta (percentage points)")
+    ax_delta.set_title("Cat LR Delta (bars: red=wipeout, amber=mixed, green=proportional)")
+    ax_delta.legend(fontsize=8)
+
+    # ── Panel 2: Regime indicator (stacked horizontal bars) ──────────────────
+    wipeout_pcts = [
+        r.wipeout_fraction * 100 if not math.isnan(r.wipeout_fraction) else 0.0
+        for r in results
+    ]
+    partial_pcts = [100.0 - w for w in wipeout_pcts]
+
+    ax_regime.barh(x, wipeout_pcts,
+                   height=0.5, color="firebrick",  alpha=0.8, label="Wipeout events")
+    ax_regime.barh(x, partial_pcts, left=wipeout_pcts,
+                   height=0.5, color="steelblue",  alpha=0.8, label="Partial-loss events")
+    ax_regime.axvline(20, color="black", linestyle="--", linewidth=1,  label="20% threshold")
+    ax_regime.axvline(80, color="black", linestyle=":",  linewidth=1,  label="80% threshold")
+    ax_regime.set_yticks(x)
+    ax_regime.set_yticklabels(labels, fontsize=9)
+    ax_regime.set_xlabel("% of cat events")
+    ax_regime.set_title("Cat Event Regime: Wipeout vs Partial Loss")
+    ax_regime.legend(fontsize=8)
+
+    # ── Panel 3: LR time series — calibrated config (cat vs no-cat) ──────────
+    calib_res = next(
+        (r for r in results if "calibrated-rpy" in r.label.lower()),
+        results[-1],
+    )
+    horizon = max(
+        (max(d.keys()) + 1 for d in calib_res.lr_by_seed_cat.values() if d),
+        default=50,
+    )
+    all_years = list(range(horizon))
+
+    def _band(
+        lr_dict_by_seed: dict,
+        years: list,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        means, stds = [], []
+        for y in years:
+            vals = [lr_dict_by_seed[s][y]
+                    for s in lr_dict_by_seed if y in lr_dict_by_seed[s]]
+            means.append(statistics.mean(vals) if vals else float("nan"))
+            stds.append(statistics.stdev(vals) if len(vals) > 1 else 0.0)
+        return np.array(years), np.array(means), np.array(stds)
+
+    yrs_a, cat_means,   cat_stds   = _band(calib_res.lr_by_seed_cat,   all_years)
+    _,     nocat_means, nocat_stds = _band(calib_res.lr_by_seed_nocat, all_years)
+
+    valid_c  = ~np.isnan(cat_means)
+    valid_nc = ~np.isnan(nocat_means)
+
+    ax_ts.plot(yrs_a[valid_c],  cat_means[valid_c],
+               color="steelblue", linewidth=2, label="Cat arm (mean)")
+    ax_ts.fill_between(yrs_a[valid_c],
+                       cat_means[valid_c]   - cat_stds[valid_c],
+                       cat_means[valid_c]   + cat_stds[valid_c],
+                       color="steelblue", alpha=0.15)
+    ax_ts.plot(yrs_a[valid_nc], nocat_means[valid_nc],
+               color="darkorange", linestyle="--", linewidth=2, label="No-cat arm (mean)")
+    ax_ts.fill_between(yrs_a[valid_nc],
+                       nocat_means[valid_nc] - nocat_stds[valid_nc],
+                       nocat_means[valid_nc] + nocat_stds[valid_nc],
+                       color="darkorange", alpha=0.10)
+
+    # Shade years where any seed had a cat event
+    cat_year_set: set[int] = set()
+    for evts in calib_res.cat_events_per_seed.values():
+        for ev in evts:
+            cat_year_set.add(ev["year"])
+    for y in sorted(cat_year_set):
+        if y < horizon:
+            ax_ts.axvspan(y - 0.5, y + 0.5, color="red", alpha=0.07)
+
+    ax_ts.axhline(1.0, color="red",   linestyle="--", linewidth=0.8)
+    ax_ts.set_title(f"LR: cat vs no-cat ({calib_res.label})\n(red shading = cat-active year)")
+    ax_ts.set_xlabel("Year")
+    ax_ts.set_ylabel("Loss Ratio")
+    ax_ts.legend(fontsize=8)
+
+    # ── Panel 4: Calibration scorecard vs Lloyd's benchmarks ─────────────────
+    score_metrics = ["period", "hhi", "combined_ratio", "roc", "cat_lr_delta"]
+    score_labels  = {
+        "period":         "Cycle Period (yr)",
+        "hhi":            "HHI",
+        "combined_ratio": "Combined Ratio",
+        "roc":            "Return on Capital",
+        "cat_lr_delta":   "Cat LR Delta",
+    }
+
+    def _get_metric(r: CatCalibResult, m: str) -> float:
+        if m == "period":         return r.mean_period if r.mean_period is not None else float("nan")
+        if m == "hhi":            return r.mean_hhi
+        if m == "combined_ratio": return r.mean_cr
+        if m == "roc":            return r.mean_roc
+        if m == "cat_lr_delta":   return r.mean_cat_lr_delta
+        return float("nan")
+
+    y_pos = list(range(len(score_metrics)))
+    ax_score.set_yticks(y_pos)
+    ax_score.set_yticklabels([score_labels[m] for m in score_metrics], fontsize=9)
+    ax_score.set_title("Scorecard vs Lloyd's Benchmarks\n(calibrated config, ◆ = in-band)")
+
+    for yi, m in enumerate(score_metrics):
+        lo, hi = LLOYDS_BENCHMARKS[m]
+        ax_score.barh(yi, hi - lo, left=lo, height=0.4, color="green", alpha=0.20, zorder=1)
+        ax_score.plot([lo, hi], [yi, yi], color="green", linewidth=1.5, zorder=2)
+        val = _get_metric(calib_res, m)
+        if not math.isnan(val):
+            in_band = lo <= val <= hi
+            ax_score.scatter(val, yi,
+                             color="steelblue" if in_band else "firebrick",
+                             s=120, zorder=5, marker="D")
+
+    ax_score.set_xlabel("Metric value")
+
+    # ── Panel 5: Phase diagram (rpy × capital, coloured by wipeout_fraction) ─
+    rpy_vals = [r.risks_per_year  for r in results]
+    cap_vals = [r.initial_capital for r in results]
+    wf_vals  = [
+        r.wipeout_fraction if not math.isnan(r.wipeout_fraction) else 1.0
+        for r in results
+    ]
+
+    sc = ax_phase.scatter(
+        rpy_vals, cap_vals,
+        c=wf_vals, cmap="RdYlGn_r", vmin=0, vmax=1,
+        s=200, zorder=5, edgecolors="k", linewidths=0.8,
+    )
+    plt.colorbar(sc, ax=ax_phase, label="Wipeout fraction", fraction=0.046, pad=0.04)
+
+    for r in results:
+        ax_phase.annotate(
+            r.label,
+            (r.risks_per_year, r.initial_capital),
+            textcoords="offset points", xytext=(6, 4), fontsize=7,
+        )
+
+    ax_phase.axvline(40,  color="grey",  linestyle="--", linewidth=1,   alpha=0.7,
+                     label="rpy=40 (LLN onset)")
+    ax_phase.axvline(400, color="black", linestyle="--", linewidth=1.2,
+                     label="rpy=400 (proportional regime)")
+
+    # Peril exposure constraint line for n_syn=20, n_regions=5, avg_limit=1250
+    rpy_range      = np.linspace(10, max(rpy_vals) * 1.2, 300)
+    cap_constraint = (rpy_range / 20 / 5) * 1250 / 0.7
+    ax_phase.plot(rpy_range, cap_constraint,
+                  color="steelblue", linestyle="-.", linewidth=1.5,
+                  label="Peril exposure limit (n_syn=20)")
+
+    ax_phase.set_xscale("log")
+    ax_phase.set_yscale("log")
+    ax_phase.set_xlabel("Risks per year (log scale)")
+    ax_phase.set_ylabel("Initial capital (log scale)")
+    ax_phase.set_title("Phase Diagram: rpy × Capital\n(colour = wipeout fraction)")
+    ax_phase.legend(fontsize=7, loc="upper left")
+
+    # ── Panel 6: Summary table ────────────────────────────────────────────────
+    ax_table.axis("off")
+    col_headers = ["Label", "rpy", "Capital", "cat_freq",
+                   "Cat Δ (pp)", "Wipeout%", "Period", "HHI", "t(s)"]
+    rows = []
+    for r in results:
+        ps    = f"{r.mean_period:.1f}" if r.mean_period is not None else "N/A"
+        wf_s  = (f"{r.wipeout_fraction*100:.0f}%"
+                 if not math.isnan(r.wipeout_fraction) else "N/A")
+        rows.append([
+            r.label,
+            str(r.risks_per_year),
+            f"{r.initial_capital:.0f}",
+            f"{r.cat_freq:.2f}",
+            f"{r.mean_cat_lr_delta*100:.1f}",
+            wf_s,
+            ps,
+            f"{r.mean_hhi:.3f}",
+            f"{r.runtime_seconds:.0f}",
+        ])
+
+    tbl = ax_table.table(
+        cellText=rows,
+        colLabels=col_headers,
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.scale(1.0, 1.5)
+    ax_table.set_title("Summary Statistics", pad=12)
+
+    # Colour cat-delta cells: green if in Lloyd's [30, 50] pp band
+    for row_idx, r in enumerate(results, start=1):
+        delta_pp   = r.mean_cat_lr_delta * 100
+        cell_color = "lightgreen" if 30 <= delta_pp <= 50 else "lightyellow"
+        tbl[(row_idx, 4)].set_facecolor(cell_color)
+
+    fig.suptitle(
+        "Experiment 3c: Catastrophe Calibration — Wipeout vs Proportional Regime\n"
+        "Threshold: rpy≥400 ensures proportional cat losses | "
+        "Target: cat LR delta 30–50 pp, wipeout < 30%",
+        fontsize=11,
+    )
+    plt.tight_layout()
+    path = f"{OUTPUT_DIR}/{filename}"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 # ── Section 10: main() ────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -3592,6 +4358,79 @@ def main() -> None:
               f"{r.mean_hhi:>8.4f} {r.mean_cf_total:>10.1f} {r.cf_pct_of_claims:>5.1f}%")
 
     p = plot_22_runoff(ro_results, "diag_22_runoff.png")
+    print(f"  Saved: {p}")
+
+    # ── Phase 18: Experiment 3b — High-Volume Lloyd's-Realistic Density ───────
+    print("\n" + "=" * 60)
+    print("Phase 18: Experiment 3b — High-Volume Lloyd's-Realistic Density")
+    print("         20 syn / 10 brok / 2000 rpy = 100 risks/syn/yr (~8% Lloyd's)")
+    print("         Reference arm: same agents, 50 rpy (2.5 risks/syn/yr)")
+    print("         Primary question: does Law of Large Numbers suppress cycles?")
+    print("         (5 seeds × 25yr, no cats, capital=50000 for exposure headroom)")
+    print("=" * 60)
+
+    hv_configs: list[tuple[str, int, int, int, int]] = [
+        # (label,              n_syn, n_brok, rpy,    cap)
+        # capital=50000 needed so peril-exposure cap (70%×cap per region) allows
+        # 2000 rpy with default limit range (500–2000); both arms use same cap.
+        ("50-rpy (ref)",       20,    10,      50,  50000),
+        ("2000-rpy (HV)",      20,    10,    2000,  50000),
+    ]
+    hv_results = run_high_volume_sweep(
+        hv_configs,
+        n_seeds=5,
+        horizon=25,
+    )
+
+    print(f"\n{'Config':<20} {'rpy':>6} {'rps/syn':>8} {'Period':>8} "
+          f"{'Amplitude':>10} {'MeanLR':>8} {'LR_CV':>7} {'HHI':>8} {'t(s)':>6}")
+    print("-" * 85)
+    for r in hv_results:
+        ps = f"{r.mean_period:.1f}" if r.mean_period is not None else "N/A"
+        print(f"{r.label:<20} {r.risks_per_year:>6} {r.risks_per_syn_yr:>8.1f} "
+              f"{ps:>8} {r.mean_amplitude:>10.4f} {r.mean_lr:>8.4f} "
+              f"{r.lr_cv:>7.4f} {r.mean_hhi:>8.4f} {r.runtime_seconds:>6.0f}")
+
+    if len(hv_results) == 2:
+        ref_r, hv_r = hv_results
+        amp_change = (hv_r.mean_amplitude - ref_r.mean_amplitude) / ref_r.mean_amplitude * 100
+        cv_change  = (hv_r.lr_cv          - ref_r.lr_cv)          / ref_r.lr_cv          * 100
+        print(f"\n  LLN effect: amplitude {amp_change:+.1f}%, LR CV {cv_change:+.1f}%")
+        print(f"  {'LLN suppresses amplitude ✓' if amp_change < -10 else 'Cycle amplitude largely unchanged (behavioural mechanism dominant)'}")
+
+    p = plot_23_high_volume(hv_results, "diag_23_high_volume.png")
+    print(f"  Saved: {p}")
+
+    # ── Phase 19: Experiment 3c — Catastrophe Calibration Regime ─────────────
+    print("\n" + "=" * 60)
+    print("Phase 19: Experiment 3c — Cat Calibration (wipeout vs proportional)")
+    print("         Derived threshold: rpy≥400 for proportional regime")
+    print("         Calibrated config: n_syn=20, rpy=500, cap=15000, cat_freq=0.05")
+    print("         2-arm (cat / no-cat), 5 seeds × 50yr per config")
+    print("=" * 60)
+
+    cat_calib_configs: list[tuple] = [
+        # (label,                   n_syn, n_brok, rpy,   capital,   cat_freq)
+        ("default-uncalibrated",    10,    4,        25,   2_000.0,   0.05),
+        ("rpy=100 (transition)",    20,   10,       100,   5_000.0,   0.05),
+        ("calibrated-rpy=500",      20,   10,       500,  15_000.0,   0.05),
+        ("calibrated-highcat",      20,   10,       500,  15_000.0,   0.10),
+    ]
+
+    cc_results = run_cat_calib_sweep(cat_calib_configs, n_seeds=5, horizon=50)
+
+    print(f"\n{'Config':<28} {'rpy':>5} {'cap':>7} {'cat_δ(pp)':>10} "
+          f"{'wipeout%':>9} {'period':>7} {'HHI':>7} {'t(s)':>6}")
+    print("-" * 80)
+    for r in cc_results:
+        ps   = f"{r.mean_period:.1f}" if r.mean_period is not None else "N/A"
+        wf_s = (f"{r.wipeout_fraction*100:.0f}%"
+                if not math.isnan(r.wipeout_fraction) else "N/A")
+        print(f"{r.label:<28} {r.risks_per_year:>5} {r.initial_capital:>7.0f} "
+              f"{r.mean_cat_lr_delta*100:>10.1f} {wf_s:>9} {ps:>7} "
+              f"{r.mean_hhi:>7.3f} {r.runtime_seconds:>6.0f}")
+
+    p = plot_24_cat_calibration(cc_results, "diag_24_cat_calibration.png")
     print(f"  Saved: {p}")
 
     print("\nDone. All PNGs saved to working directory.")
